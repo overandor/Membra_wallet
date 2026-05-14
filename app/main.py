@@ -27,10 +27,9 @@ from app.schemas import (
 )
 from app.services.audit import audit
 from app.services.balance import BalanceService
+from app.services.commands import HELP_TEXT, ConsoleNotifier, parse_sms_command
+from app.services.identifiers import normalize_alias
 from app.services.payments import create_payment_intent
-from app.services.phone import normalize_phone
-from app.services.risk import RiskDecision, ensure_amount_allowed, ensure_user_can_initiate
-from app.services.sms import HELP_TEXT, ConsoleSmsProvider, parse_sms_command
 from app.services.users import (
     create_or_get_user,
     create_verification_session,
@@ -43,6 +42,26 @@ app = FastAPI(
     version="0.1.0",
     description="Non-custodial SMS relay for Bitcoin and Lightning wallet actions.",
 )
+
+
+class ActionBlocked(Exception):
+    pass
+
+
+def ensure_user_ready(user: User) -> None:
+    if not user.verified:
+        raise ActionBlocked("Alias is not verified.")
+    if user.locked or user.status == UserStatus.locked:
+        raise ActionBlocked("Alias is locked.")
+
+
+def ensure_amount_allowed(amount_sats: int, settings: Settings, action: str) -> None:
+    if amount_sats <= 0:
+        raise ActionBlocked("Amount must be greater than zero.")
+    if action == "send" and amount_sats > settings.max_sms_send_sats:
+        raise ActionBlocked("Amount exceeds SMS send limit. Use a secure wallet flow.")
+    if action == "approve" and amount_sats > settings.max_sms_approve_sats:
+        raise ActionBlocked("Amount exceeds SMS approval limit. Use a secure wallet flow.")
 
 
 @app.on_event("startup")
@@ -62,7 +81,7 @@ def register_user(
 ) -> RegisterUserResponse:
     user, state = create_or_get_user(db, payload.phone_e164, payload.display_name)
     verification = create_verification_session(db, user.phone_e164)
-    ConsoleSmsProvider().send_sms(user.phone_e164, f"Membra verification code: {verification.code}")
+    ConsoleNotifier().send_sms(user.phone_e164, f"Membra verification code: {verification.code}")
     audit(db, "user.register", actor_user_id=user.id, entity_type="user", entity_id=user.id)
     return RegisterUserResponse(
         user_id=user.id,
@@ -79,7 +98,7 @@ def verify_user(payload: VerifyUserRequest, db: Session = Depends(get_db)) -> di
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     audit(db, "user.verify", actor_user_id=user.id, entity_type="user", entity_id=user.id)
-    return {"user_id": user.id, "status": user.status.value, "message": "Phone alias verified."}
+    return {"user_id": user.id, "status": user.status.value, "message": "Alias verified."}
 
 
 @app.post("/v1/users/{user_id}/lock")
@@ -148,15 +167,19 @@ async def get_balance(
 
 
 @app.post("/v1/payment-requests", response_model=PaymentRequestResponse)
-def create_request(payload: PaymentRequestCreate, db: Session = Depends(get_db)) -> PaymentRequestResponse:
+def create_request(
+    payload: PaymentRequestCreate,
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> PaymentRequestResponse:
     requester = get_user_by_phone(db, payload.requester_phone)
     payer = get_user_by_phone(db, payload.payer_phone)
     if not requester or not payer:
-        raise HTTPException(status_code=404, detail="Requester or payer phone alias not found")
+        raise HTTPException(status_code=404, detail="Requester or payer alias not found")
     try:
-        ensure_user_can_initiate(requester)
-        ensure_amount_allowed(payload.amount_sats, get_settings(), "send")
-    except RiskDecision as exc:
+        ensure_user_ready(requester)
+        ensure_amount_allowed(payload.amount_sats, settings, "send")
+    except ActionBlocked as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     request = PaymentRequest(
@@ -169,10 +192,10 @@ def create_request(payload: PaymentRequestCreate, db: Session = Depends(get_db))
     db.commit()
     db.refresh(request)
     audit(db, "payment_request.create", actor_user_id=requester.id, entity_type="request", entity_id=request.id)
-    ConsoleSmsProvider().send_sms(
+    ConsoleNotifier().send_sms(
         payer.phone_e164,
-        f"Membra: {requester.phone_e164} requests {request.amount_sats} sats"
-        f" for {request.memo or 'payment'}. Reply APPROVE {request.id} or DENY {request.id}.",
+        f"Membra: {requester.phone_e164} requests {request.amount_sats} sats. "
+        f"Reply APPROVE {request.id} or DENY {request.id}.",
     )
     return PaymentRequestResponse(
         request_id=request.id,
@@ -190,11 +213,11 @@ def create_intent(
     sender = get_user_by_phone(db, payload.sender_phone)
     recipient = get_user_by_phone(db, payload.recipient_phone)
     if not sender or not recipient:
-        raise HTTPException(status_code=404, detail="Sender or recipient phone alias not found")
+        raise HTTPException(status_code=404, detail="Sender or recipient alias not found")
     try:
-        ensure_user_can_initiate(sender)
+        ensure_user_ready(sender)
         ensure_amount_allowed(payload.amount_sats, settings, "send")
-    except RiskDecision as exc:
+    except ActionBlocked as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     intent = create_payment_intent(
         db,
@@ -220,11 +243,11 @@ def inbound_sms(
     db: Session = Depends(get_db),
     settings: Settings = Depends(get_settings),
 ) -> SmsResponse:
-    from_phone = normalize_phone(payload.from_phone)
+    from_alias = normalize_alias(payload.from_phone)
     parsed = parse_sms_command(payload.body)
-    response = _handle_sms_command(db, settings, from_phone, parsed)
+    response = _handle_sms_command(db, settings, from_alias, parsed)
     sms = InboundSms(
-        from_phone=from_phone,
+        from_phone=from_alias,
         body=payload.body,
         parsed_command=parsed.command,
         response_body=response,
@@ -234,25 +257,25 @@ def inbound_sms(
     return SmsResponse(message=response)
 
 
-def _handle_sms_command(db: Session, settings: Settings, from_phone: str, parsed) -> str:
+def _handle_sms_command(db: Session, settings: Settings, from_alias: str, parsed) -> str:
     if parsed.command in {"HELP", "UNKNOWN", "INVALID", "EMPTY"}:
         return HELP_TEXT
 
     if parsed.command == "REGISTER":
-        user, _ = create_or_get_user(db, from_phone)
+        user, _ = create_or_get_user(db, from_alias)
         verification = create_verification_session(db, user.phone_e164)
         return f"Membra code: {verification.code}. Reply VERIFY {verification.code}."
 
     if parsed.command == "VERIFY":
         try:
-            user = verify_phone(db, from_phone, parsed.request_id or "")
+            user = verify_phone(db, from_alias, parsed.request_id or "")
         except ValueError as exc:
             return str(exc)
         return f"Verified {user.phone_e164}. Membra is a non-custodial SMS relay."
 
-    user = get_user_by_phone(db, from_phone)
+    user = get_user_by_phone(db, from_alias)
     if not user:
-        return "Reply REGISTER to create a phone alias first."
+        return "Reply REGISTER to create an alias first."
 
     if parsed.command == "LOCK":
         user.locked = True
@@ -269,7 +292,7 @@ def _handle_sms_command(db: Session, settings: Settings, from_phone: str, parsed
             return HELP_TEXT
         payer = get_user_by_phone(db, parsed.counterparty_phone)
         if not payer:
-            return "Payer phone alias not found. Ask them to REGISTER first."
+            return "Payer alias not found. Ask them to REGISTER first."
         request = PaymentRequest(
             requester_user_id=user.id,
             payer_user_id=payer.id,
@@ -286,11 +309,11 @@ def _handle_sms_command(db: Session, settings: Settings, from_phone: str, parsed
             return HELP_TEXT
         recipient = get_user_by_phone(db, parsed.counterparty_phone)
         if not recipient:
-            return "Recipient phone alias not found."
+            return "Recipient alias not found."
         try:
-            ensure_user_can_initiate(user)
+            ensure_user_ready(user)
             ensure_amount_allowed(parsed.amount_sats, settings, "send")
-        except RiskDecision as exc:
+        except ActionBlocked as exc:
             return str(exc)
         intent = create_payment_intent(
             db,
@@ -303,6 +326,8 @@ def _handle_sms_command(db: Session, settings: Settings, from_phone: str, parsed
         return f"Payment intent {intent.id} created. Complete from your wallet: {intent.wallet_action_url}"
 
     if parsed.command in {"APPROVE", "DENY"}:
+        if not parsed.request_id:
+            return HELP_TEXT
         request = db.get(PaymentRequest, parsed.request_id)
         if not request:
             return "Request not found."
@@ -314,9 +339,9 @@ def _handle_sms_command(db: Session, settings: Settings, from_phone: str, parsed
             db.commit()
             return f"Denied {request.id}."
         try:
-            ensure_user_can_initiate(user)
+            ensure_user_ready(user)
             ensure_amount_allowed(request.amount_sats, settings, "approve")
-        except RiskDecision as exc:
+        except ActionBlocked as exc:
             return str(exc)
         requester = db.get(User, request.requester_user_id)
         if not requester:
@@ -340,8 +365,6 @@ def _handle_sms_command(db: Session, settings: Settings, from_phone: str, parsed
 
 @app.get("/wallet-action/{intent_id}")
 def wallet_action(intent_id: str, db: Session = Depends(get_db)) -> dict[str, str | int | None]:
-    # In production this page should deep-link to the user's wallet, show a Lightning invoice,
-    # or request wallet signature/approval. It must not spend server-side.
     from app.models import PaymentIntent
 
     intent = db.get(PaymentIntent, intent_id)
