@@ -1,11 +1,14 @@
 """MEMBRA Wallet — payout eligibility and ledger boundary.
 
-This service records balances, holds, Stripe checkout/webhook events, and payout eligibility.
-It does not custody funds, move money, or request private keys/seed phrases. External regulated rails settle money.
+This service records balances, holds, Stripe checkout/webhook events, payout eligibility,
+and canonical MEMBRA OS event envelopes. It does not custody funds, move money, or
+request private keys/seed phrases. External regulated rails settle money.
 """
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
+import hmac
 import json
 import os
 import sqlite3
@@ -21,18 +24,22 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 APP_NAME = "MEMBRA Wallet"
+APP_VERSION = "1.1.0"
 DB_PATH = Path(os.getenv("APP_DB_PATH", "/tmp/membra_wallet.sqlite3"))
 APP_BASE_URL = os.getenv("APP_BASE_URL", "http://localhost:7860").rstrip("/")
+MEMBRA_EVENT_SECRET = os.getenv("MEMBRA_EVENT_SECRET", "")
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 STRIPE_PRICE_ID = os.getenv("STRIPE_PRICE_ID", "")
 stripe.api_key = STRIPE_SECRET_KEY or None
-api = FastAPI(title=APP_NAME, version="1.0.0")
+api = FastAPI(title=APP_NAME, version=APP_VERSION)
+
 
 class AccountIn(BaseModel):
     email: str
     display_name: str = "MEMBRA Account"
     public_wallet: str = ""
+
 
 class LedgerEventIn(BaseModel):
     account_id: str
@@ -43,10 +50,28 @@ class LedgerEventIn(BaseModel):
     status: str = "recorded_not_settled"
     metadata: dict[str, Any] = Field(default_factory=dict)
 
+
 class CheckoutIn(BaseModel):
     email: str
     subject_type: str = "membership"
     subject_id: str = "membra"
+
+
+class MembraEventIn(BaseModel):
+    event_id: str
+    event_type: str
+    source_module: str
+    subject_type: str
+    subject_id: str
+    owner_id: str | None = None
+    correlation_id: str | None = None
+    causation_id: str | None = None
+    created_at: str
+    consent_scope: str | None = None
+    risk_level: str = "normal"
+    payload: dict[str, Any] = Field(default_factory=dict)
+    proof_hash: str | None = None
+    signature: str | None = None
 
 
 def now() -> str:
@@ -55,6 +80,20 @@ def now() -> str:
 
 def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
+
+
+def canonical(payload: dict[str, Any]) -> str:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+
+
+def verify_event_signature(event: dict[str, Any]) -> bool:
+    if not MEMBRA_EVENT_SECRET:
+        return True
+    supplied = event.get("signature") or ""
+    unsigned = dict(event)
+    unsigned["signature"] = None
+    expected = "hmac_sha256:" + hmac.new(MEMBRA_EVENT_SECRET.encode("utf-8"), canonical(unsigned).encode("utf-8"), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(supplied, expected)
 
 
 def db() -> sqlite3.Connection:
@@ -71,17 +110,36 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS ledger_events(ledger_event_id TEXT PRIMARY KEY,account_id TEXT,subject_type TEXT,subject_id TEXT,event_type TEXT,amount_usd REAL,status TEXT,metadata_json TEXT,created_at TEXT);
         CREATE TABLE IF NOT EXISTS payout_eligibility(payout_id TEXT PRIMARY KEY,account_id TEXT,subject_type TEXT,subject_id TEXT,eligible_amount_usd REAL,reason TEXT,status TEXT,created_at TEXT);
         CREATE TABLE IF NOT EXISTS stripe_events(event_id TEXT PRIMARY KEY,stripe_event_type TEXT,subject_type TEXT,subject_id TEXT,payload_json TEXT,created_at TEXT);
+        CREATE TABLE IF NOT EXISTS events(
+          event_id TEXT PRIMARY KEY,
+          event_type TEXT,
+          source_module TEXT,
+          subject_type TEXT,
+          subject_id TEXT,
+          owner_id TEXT,
+          risk_level TEXT,
+          proof_hash TEXT,
+          signature TEXT,
+          payload_json TEXT,
+          status TEXT,
+          created_at TEXT,
+          ingested_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_wallet_events_type ON events(event_type);
+        CREATE INDEX IF NOT EXISTS idx_wallet_events_subject ON events(subject_type, subject_id);
         """)
+
 
 init_db()
 
 
 def rows(table: str) -> list[dict[str, Any]]:
-    allowed = {"accounts", "ledger_events", "payout_eligibility", "stripe_events"}
+    allowed = {"accounts", "ledger_events", "payout_eligibility", "stripe_events", "events"}
     if table not in allowed:
         return []
+    order_col = "ingested_at" if table == "events" else "created_at"
     with db() as conn:
-        out = conn.execute(f"SELECT * FROM {table} ORDER BY created_at DESC LIMIT 250").fetchall()
+        out = conn.execute(f"SELECT * FROM {table} ORDER BY {order_col} DESC LIMIT 250").fetchall()
     return [dict(r) for r in out]
 
 
@@ -108,25 +166,68 @@ def create_payout(account_id: str, subject_type: str, subject_id: str, amount_us
         conn.execute("INSERT INTO payout_eligibility VALUES(?,?,?,?,?,?,?,?)", tuple(row.values()))
     return row
 
+
+def project_event(data: MembraEventIn) -> list[dict[str, Any]]:
+    actions: list[dict[str, Any]] = []
+    payload = data.payload or {}
+    if data.event_type in {"visibility_confirmed", "payout_eligibility_created"}:
+        account_id = data.owner_id or payload.get("user_id") or payload.get("account_id") or "owner_unknown"
+        amount = float(payload.get("eligible_amount_usd") or payload.get("amount_usd") or 0)
+        ledger = create_ledger_record(LedgerEventIn(account_id=account_id, subject_type=data.subject_type, subject_id=data.subject_id, event_type=data.event_type, amount_usd=amount, status="eligible_pending_external_settlement", metadata=payload))
+        payout = create_payout(account_id, data.subject_type, data.subject_id, amount, f"event:{data.event_type}")
+        actions.extend([{"table": "ledger_events", "id": ledger["ledger_event_id"]}, {"table": "payout_eligibility", "id": payout["payout_id"]}])
+    return actions
+
+
 @api.get("/api/health")
 def health():
-    return {"ok": True, "app": APP_NAME, "policy": "records eligibility only; external rails settle money; no private keys"}
+    return {"ok": True, "app": APP_NAME, "version": APP_VERSION, "policy": "records eligibility only; external rails settle money; no private keys"}
+
+
+@api.get("/api/ready")
+def ready():
+    warnings = [] if MEMBRA_EVENT_SECRET else ["MEMBRA_EVENT_SECRET not configured; signed event verification is permissive"]
+    return {"ok": True, "warnings": warnings, "event_count": len(rows("events"))}
+
+
+@api.post("/api/events/ingest")
+def ingest_event(data: MembraEventIn):
+    event = data.model_dump()
+    if not verify_event_signature(event):
+        raise HTTPException(401, "invalid event signature")
+    with db() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO events VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (data.event_id, data.event_type, data.source_module, data.subject_type, data.subject_id, data.owner_id, data.risk_level, data.proof_hash, data.signature, json.dumps(event, default=str), "ingested", data.created_at, now()),
+        )
+    projections = project_event(data)
+    return {"ok": True, "event_id": data.event_id, "projections": projections}
+
+
+@api.get("/api/events")
+def list_events():
+    return {"events": rows("events")}
+
 
 @api.post("/api/accounts")
 def api_create_account(data: AccountIn):
     return create_account_record(data)
 
+
 @api.post("/api/ledger-events")
 def api_ledger(data: LedgerEventIn):
     return create_ledger_record(data)
+
 
 @api.post("/api/payout-eligibility")
 def api_payout(account_id: str, subject_type: str, subject_id: str, amount_usd: float = 0, reason: str = "proof_approved"):
     return create_payout(account_id, subject_type, subject_id, amount_usd, reason)
 
+
 @api.get("/api/{table}")
 def api_rows(table: str):
     return {table: rows(table)}
+
 
 @api.post("/api/stripe/create-checkout-session")
 def create_checkout(data: CheckoutIn):
@@ -134,6 +235,7 @@ def create_checkout(data: CheckoutIn):
         raise HTTPException(500, "Stripe not configured")
     session = stripe.checkout.Session.create(mode="payment", customer_email=data.email, line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}], success_url=f"{APP_BASE_URL}/?checkout=success", cancel_url=f"{APP_BASE_URL}/?checkout=cancelled", metadata={"subject_type": data.subject_type, "subject_id": data.subject_id})
     return {"url": session.url, "id": session.id}
+
 
 @api.post("/api/stripe/webhook")
 async def stripe_webhook(request: Request, stripe_signature: str | None = Header(default=None)):
@@ -158,8 +260,9 @@ def ui_account(email, name, public_wallet):
 def ui_ledger(account_id, subject_type, subject_id, event_type, amount, status):
     return create_ledger_record(LedgerEventIn(account_id=account_id, subject_type=subject_type, subject_id=subject_id, event_type=event_type, amount_usd=float(amount or 0), status=status)), rows("ledger_events")
 
+
 with gr.Blocks(title=APP_NAME) as demo:
-    gr.Markdown("# MEMBRA Wallet\nLedger, holds, and payout eligibility boundary. External rails settle money. Never enter seed phrases or private keys.")
+    gr.Markdown("# MEMBRA Wallet\nLedger, holds, event ingestion, and payout eligibility boundary. External rails settle money. Never enter seed phrases or private keys.")
     with gr.Tab("Accounts"):
         email = gr.Textbox(label="Email")
         name = gr.Textbox(label="Display name", value="MEMBRA Account")
@@ -179,6 +282,9 @@ with gr.Blocks(title=APP_NAME) as demo:
         ledger_json = gr.JSON(label="Ledger event")
         ledger_table = gr.Dataframe(label="Ledger", value=lambda: rows("ledger_events"))
         create_event.click(ui_ledger, [account_id, subject_type, subject_id, event_type, amount, status], [ledger_json, ledger_table])
+    with gr.Tab("Events"):
+        gr.Markdown("Canonical MEMBRA events arrive through `/api/events/ingest`.")
+        gr.Dataframe(label="Events", value=lambda: rows("events"), interactive=False)
     with gr.Tab("Policy"):
         gr.Markdown("No custody. No private keys. No guaranteed income. Proof creates eligibility only; regulated external payment rails settle money.")
 
